@@ -1,0 +1,398 @@
+<?php
+
+/**
+ * Implementation of hook_menu()
+ */
+
+function draggable_blocks_menu() {
+  $items['system/ajax/draggable-blocks'] = array(
+    'title' => 'AJAX callback for draggable blocks',
+    'page callback' => 'draggable_blocks_ajax_callback',
+    'delivery callback' => 'ajax_deliver',
+    'access arguments' => array('administer draggable blocks'),
+    'theme callback' => 'ajax_base_page_theme',
+    'type' => MENU_CALLBACK,
+  );
+
+  // Nicked from bean.module's /block/add/foo callback.
+  foreach (bean_get_types() as $type) {
+    if (!empty($type)) {
+      $items['system/ajax/block/add/' . $type->buildURL()] = array(
+        'title' => $type->getLabel(),
+        'title callback' => 'check_plain',
+        'page callback' => 'draggable_blocks_add_block_form',
+        'page arguments' => array($type->type),
+        'access arguments' => array('create any ' . $type->type . ' bean'),
+        'delivery callback' => 'ajax_deliver',
+      );
+    }
+  }
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter()
+ */
+
+function draggable_blocks_form_bean_form_alter(&$form, $form_state) {
+
+  // Detect the form being loaded over ajax by the action on it:
+  if (substr($form['#action'], 0, 19) == '/system/ajax/block/') {
+
+    $form['actions']['submit']['#ajax'] = array(
+      'callback' => 'draggable_blocks_form_ajax_callback',
+      'progress' => array(
+        '#type' => 'none',
+      ),
+    );
+
+    $form['weight'] = array(
+      '#type' => 'hidden',
+      '#default_value' => 0,
+    );
+
+    $form['region'] = array(
+      '#type' => 'hidden',
+      '#default_value' => '',
+    );
+
+    // Need to add this validate function before the others, as
+    // otherwise they're not defined for some reason.
+    $form['#after_build'][] = 'draggable_blocks_after_build';
+  }
+}
+
+/**
+ * Makes sure bean's include file for validators is included.
+ */
+
+function draggable_blocks_after_build($form, $form_state) {
+  module_load_include('inc', 'bean', 'includes/bean.pages');
+  return $form;
+}
+
+function draggable_blocks_form_ajax_callback(&$form, &$form_state) {
+
+  $commands['#type'] = 'ajax';
+  $commands['#commands'][] = ajax_command_insert(NULL, drupal_render($form));
+
+  // Remove any existing messages and replace them with any we've just generated.
+  $commands['#commands'][] = ajax_command_remove('div.messages');
+  $commands['#commands'][] = ajax_command_prepend('#bean-form', theme('status_messages'));
+
+  // If the form was validated & submitted, dismiss the dialogue & replace the block.
+  if($form_state['executed']) {
+
+    // Un-dialogue the dialogue.
+    $commands['#commands'][] = ajax_command_invoke('#bean-form', 'dialog', array('destroy'));
+
+    // Remove it from the DOM.
+    $commands['#commands'][] = ajax_command_remove('#bean-form');
+
+    // Reload the block that we've altered
+    /*
+    $delta = $form_state['build_info']['args'][0];
+    $rendered_block = subhub_magicapi_2_block_renderer($delta);
+
+    $instance = subhub_magicapi_2_split_delta($delta);
+
+    // Using the block id to replace here doesn't work for some reason...
+    $commands['#commands'][] = ajax_command_replace('div.mbid-' . $instance['mbid'], $rendered_block);
+    */
+  }
+
+  return $commands;
+}
+
+function draggable_blocks_add_block_form($type) {
+
+  require_once drupal_get_path('module', 'bean') . '/includes/bean.pages.inc';
+
+  // Create an empty bean of the required type to pass to the form builder fn
+  $bean = bean_create(array('type' => $type));
+
+  $form = drupal_get_form('bean_form', $bean, $type);
+
+  $commands['#type'] = 'ajax';
+
+  // Add the form into the DOM
+  $commands['#commands'][] = ajax_command_append('body', drupal_render($form));
+
+  $dialogue_settings = array(
+    'width' => 1000,
+    'height' => 600,
+    'modal' => TRUE,
+    'position' => 'center',
+  );
+
+  // Invoke the dialogue.
+  $commands['#commands'][] = ajax_command_invoke('#bean-form', 'dialog', array($dialogue_settings));
+
+  // Make sure messages appear
+  $commands['#commands'][] = ajax_command_prepend('body', theme('status_messages'));
+
+  return $commands;
+}
+
+/**
+ * Implementation of hook_permissions().
+ */
+function draggable_blocks_permission() {
+  $perms = array(
+    'administer draggable blocks' =>  array(
+      'title' => t('Administer draggable blocks'),
+      'description' => t('Place draggable blocks anywhere they can be placed.'),
+    ),
+  );
+  return $perms;
+}
+
+function draggable_blocks_ajax_callback() {
+
+  $theme = $_POST['ajax_page_state']['theme'];
+
+  $draggable_block_new_prefix = strlen('draggable-block-new-');
+  $draggable_block_existing_prefix = strlen('draggable-block-existing-');
+
+  foreach ($_POST['block_data'] as $weight => $block_data) {
+
+    $id = $block_data['id'];
+
+    if (substr($id, 0, $draggable_block_new_prefix) == 'draggable-block-new-') {
+
+      $type = substr($id, $draggable_block_new_prefix);
+
+      // New draggable block needs creating
+      $bean = bean_load_delta('new-bean');
+
+      if (!$bean) {
+        $bean = bean_create(array('type' => $type));
+      }
+
+      $bean->delta = 'new-bean'; // We'll overwrite this a mo.
+      $bean->title = 'New bean'; // We'll overwrite this a mo.
+      $bean->save();
+
+      _block_rehash();
+
+      db_update('block')
+        ->condition('module', 'bean')
+        ->condition('delta', $bean->delta)
+        ->condition('theme', $theme)
+        ->fields(array(
+          'weight' => $weight,
+        ))
+       ->execute();
+    }
+    else if (substr($id, 0, $draggable_block_existing_prefix) == 'draggable-block-existing-') {
+      // Existing draggable block needs placing
+    }
+    else {
+      // Existing block. Needs re-weighting.
+      $block_info = draggable_blocks_get_block_info_from_id($id);
+
+      // drupal_set_message('<pre>' . print_r($block_info, TRUE) . '</pre>');
+
+      db_update('block')
+        ->condition('module', $block_info['module'])
+        ->condition('delta', $block_info['delta'])
+        ->condition('theme', $theme)
+        ->fields(array(
+          'weight' => $weight,
+        ))
+       ->execute();
+    }
+  }
+
+  $commands['#type'] = 'ajax';
+  // $commands['#commands'][] = ajax_command_insert(NULL, drupal_render($form['settings']));
+  $commands['#commands'][] = ajax_command_prepend('#content', theme('status_messages'));
+
+  return $commands;
+}
+
+function draggable_blocks_palette() {
+
+  $palettes = array();
+
+  $palettes['beans'] = array(
+    'title' => 'Beans',
+    'id' => 'beans',
+    'access' => 'access content',
+    'presence' => PALETTE_PRESENCE_SITE_ONLY,
+    'sections' => array(
+      array(
+        'id' => 'newBeans',
+        'title' => 'New Beans',
+        'content callback' => 'draggable_blocks_new',
+        'weight' => 1,
+      ),
+      array(
+        'id' => 'existingBeans',
+        'title' => 'Existing Beans',
+        'content callback' => 'draggable_blocks_existing',
+        'weight' => 2,
+      ),
+    ),
+  );
+
+  return $palettes;
+}
+
+/**
+ * Palette callback for new blocks
+ */
+
+function draggable_blocks_new() {
+
+  return array(
+    '#markup' => theme('draggable_blocks_new', array('blocks' => bean_get_types())),
+    '#attached' => array(
+      'css' => array(drupal_get_path('module', 'draggable_blocks') . '/draggable_blocks.css'),
+      'js' => array(drupal_get_path('module', 'draggable_blocks') . '/draggable_blocks.js'),
+      'library' => array(
+        array('system','ui.sortable'),
+        array('system', 'ui.dialog'),
+      ),
+    ),
+  );
+}
+
+/**
+ * Palette callback for existing blocks
+ */
+
+function draggable_blocks_existing() {
+
+  return array(
+    '#markup' => theme('draggable_blocks_existing', array('blocks' => bean_get_all_beans())),
+    '#attached' => array(
+      'css' => array(drupal_get_path('module', 'draggable_blocks') . '/draggable_blocks.css'),
+      'js' => array(drupal_get_path('module', 'draggable_blocks') . '/draggable_blocks.js'),
+      'library' => array(
+        array('system','ui.sortable'),
+      ),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_theme
+ */
+
+function draggable_blocks_theme($existing, $type, $theme, $path) {
+  return array(
+    'draggable_block' => array(
+      'variables' => array('block' => null),
+    ),
+    'draggable_blocks_existing' => array(
+      'variables' => array('blocks' => null),
+    ),
+    'draggable_blocks_new' => array(
+      'variables' => array('blocks' => null),
+    ),
+  );
+}
+
+function theme_draggable_blocks_existing($args) {
+
+  $themed_blocks = array();
+  foreach ($args['blocks'] as $block) {
+
+    $block_args = array(
+      'id' => 'draggable-block-existing-' . $block->delta,
+      'title' => $block->title,
+    );
+
+    $themed_blocks[] = theme('draggable_block', $block_args);
+  }
+  return implode('', $themed_blocks);
+}
+
+function theme_draggable_blocks_new($args) {
+
+  $themed_blocks = array();
+  foreach ($args['blocks'] as $key => $block_type) {
+
+    $block_args = array(
+      'id' => 'draggable-block-new-' . $key,
+      'title' => $block_type->getLabel(),
+    );
+
+    $themed_blocks[] = theme('draggable_block', $block_args);
+  }
+  return implode('', $themed_blocks);
+}
+
+function theme_draggable_block($args) {
+    return '
+<div class="draggable-block clearfix from-palette" id="' . $args['id'] . '">
+  <div class="text">
+    ' . $args['title'] . '
+  </div>
+</div>';
+}
+
+/**
+ * Pass in a block id, like: block-module-delta and this function
+ * will return the module & delta of that block.
+ */
+
+function draggable_blocks_get_block_info_from_id($id) {
+
+  // Break up the id into chunks
+  $id_bits = explode('-', $id);
+
+  // First element is 'block'. We don't need that.
+  array_shift($id_bits);
+
+  $bits_count = count($id_bits);
+
+  $block_glue = array('_', '-', ' ');
+
+  // If any module uses a different glue, they can add it here:
+  drupal_alter('block_glue', $block_glue);
+
+  // This first level of loop moves the split between module and delta
+  // down the id. EG: is foo-bar-grill-baz:
+  // module foo, delta bar_grill_baz
+  // module foo_bar, delta grill_baz
+  // module for_bar_grill, delta baz
+
+  for ($i=1; $i<$bits_count; $i++) {
+
+    // We then loop across the glues to check varying combinations.
+    // Eg, a module called foo_bar may have deltas like grill-baz
+    foreach ($block_glue as $module_glue) {
+      foreach ($block_glue as $delta_glue) {
+
+        $module = implode($module_glue, array_slice($id_bits, 0, $i));
+
+        // Check to see if we got an existing module:
+        if (!module_exists($module)) {
+          continue;
+        }
+
+        // Check to see if this module actually defines any blocks
+        $blocks = module_invoke($module, 'block_info');
+
+        if (is_array($blocks)) {
+          $delta = implode($delta_glue, array_slice($id_bits, $i));
+
+          // If we got module/delta match, return it!
+          // otherwise, the search continues...
+          if (isset($blocks[$delta])) {
+
+            return array(
+              'module' => $module,
+              'delta' => $delta,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
